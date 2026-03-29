@@ -72,11 +72,14 @@ def _tq_mse_score_kernel(
         ).to(tl.int32)
 
         for sub in tl.static_range(VALS_PER_BYTE):
-            coord = byte_idx * VALS_PER_BYTE + sub
-            if coord < D:
-                idx = (packed >> (sub * BITS)) & BIT_MASK
-                c = tl.load(CENTROIDS_ptr + idx)
-                scores += tl.load(Q_ROT_ptr + pid_bh * stride_q_bh + coord * stride_q_d).to(tl.float32) * c
+            # D is always divisible by VALS_PER_BYTE for all supported head dims
+            # (64, 96, 128 are all divisible by 2). No guard needed — avoids
+            # sm_121 Triton bug where `if constexpr_val < D` inside static_range
+            # produces incorrect numerical results.
+            coord: tl.constexpr = byte_idx * VALS_PER_BYTE + sub
+            idx = (packed >> (sub * BITS)) & BIT_MASK
+            c = tl.load(CENTROIDS_ptr + idx)
+            scores += tl.load(Q_ROT_ptr + pid_bh * stride_q_bh + coord * stride_q_d).to(tl.float32) * c
 
     norms = tl.load(NORMS_ptr + pid_bh * stride_n_bh + n_offs * stride_n_n,
                     mask=n_mask, other=0.0).to(tl.float32)
@@ -119,12 +122,13 @@ def _tq_qjl_score_kernel(
         ).to(tl.int32)
 
         for bit in tl.static_range(8):
-            coord = byte_idx * 8 + bit
-            if coord < D:
-                sign_bit = (packed >> bit) & 1
-                sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
-                q_val = tl.load(Q_SKETCH_ptr + pid_bh * stride_qs_bh + coord * stride_qs_d).to(tl.float32)
-                dot += q_val * sign_val
+            # D is always divisible by 8 for all supported head dims (64, 96, 128).
+            # Removing the `if coord < D` guard to avoid sm_121 Triton precision bug.
+            coord: tl.constexpr = byte_idx * 8 + bit
+            sign_bit = (packed >> bit) & 1
+            sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
+            q_val = tl.load(Q_SKETCH_ptr + pid_bh * stride_qs_bh + coord * stride_qs_d).to(tl.float32)
+            dot += q_val * sign_val
 
     res_norms = tl.load(RES_NORMS_ptr + pid_bh * stride_rn_bh + n_offs * stride_rn_n,
                         mask=n_mask, other=0.0).to(tl.float32)
@@ -188,12 +192,11 @@ def _tq_fused_decode_kernel(
                 mask=n_mask, other=0,
             ).to(tl.int32)
             for sub in tl.static_range(VALS_PER_BYTE):
-                coord = byte_idx * VALS_PER_BYTE + sub
-                if coord < D:
-                    idx = (packed >> (sub * BITS)) & BIT_MASK
-                    c = tl.load(CENTROIDS_ptr + idx)
-                    q_val = tl.load(Q_ROT_ptr + pid_bh * stride_q_bh + coord * stride_q_d).to(tl.float32)
-                    mse_s += q_val * c
+                coord: tl.constexpr = byte_idx * VALS_PER_BYTE + sub
+                idx = (packed >> (sub * BITS)) & BIT_MASK
+                c = tl.load(CENTROIDS_ptr + idx)
+                q_val = tl.load(Q_ROT_ptr + pid_bh * stride_q_bh + coord * stride_q_d).to(tl.float32)
+                mse_s += q_val * c
 
         key_norms = tl.load(NORMS_ptr + pid_bh * stride_n_bh + n_offs * stride_n_n,
                             mask=n_mask, other=0.0).to(tl.float32)
@@ -207,12 +210,11 @@ def _tq_fused_decode_kernel(
                 mask=n_mask, other=0,
             ).to(tl.int32)
             for bit in tl.static_range(8):
-                coord = byte_idx * 8 + bit
-                if coord < D:
-                    sign_bit = (packed >> bit) & 1
-                    sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
-                    q_val = tl.load(Q_SKETCH_ptr + pid_bh * stride_q_bh + coord * stride_q_d).to(tl.float32)
-                    qjl_dot += q_val * sign_val
+                coord: tl.constexpr = byte_idx * 8 + bit
+                sign_bit = (packed >> bit) & 1
+                sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
+                q_val = tl.load(Q_SKETCH_ptr + pid_bh * stride_q_bh + coord * stride_q_d).to(tl.float32)
+                qjl_dot += q_val * sign_val
 
         res_norms = tl.load(RES_NORMS_ptr + pid_bh * stride_rn_bh + n_offs * stride_rn_n,
                             mask=n_mask, other=0.0).to(tl.float32)
@@ -270,9 +272,11 @@ def tq_mse_score(
         query_rot = query_rot.squeeze(1)
 
     BH, D = query_rot.shape
+    eff_bits, vpb = _packing_params(mse_bits)
+    assert D % vpb == 0, f"head_dim {D} must be divisible by VALS_PER_BYTE={vpb}"
+    assert D % 8 == 0, f"head_dim {D} must be divisible by 8 for QJL packing"
     N = mse_packed.shape[1]
     PACKED_D = mse_packed.shape[2]
-    eff_bits, vpb = _packing_params(mse_bits)
 
     out = torch.empty(BH, N, device=query_rot.device, dtype=torch.float32)
     grid = lambda meta: (BH, triton.cdiv(N, meta["BLOCK_N"]))
